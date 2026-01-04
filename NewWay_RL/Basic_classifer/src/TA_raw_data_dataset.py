@@ -1,0 +1,239 @@
+import os
+import numpy as np
+import torch
+from torch.utils.data import Dataset, DataLoader
+from typing import List, Dict, Any
+import pandas as pd
+import torch
+from torch.utils.data import Dataset
+from transformers import RobertaTokenizer
+from data_loader_word import wordMELDDataset
+from audio_dataset import Dataset_meld_audio
+
+
+class TA_raw_MELDDataset(Dataset):
+    """
+    PyTorch Dataset for MELD multimodal emotion recognition.
+    Loads and aligns text, audio, and video features based on sample_names.
+    """
+
+    def __init__(
+            self,
+            text_npz: str,
+            audio_npz: str,
+            video_npz: str,
+            modalities: List[str],
+            split: str = 'train',
+            feature_type: str = 'pooled_features',
+            text_path: str = 'data/MELD.Raw/train_raw.csv',
+            audio_csv_path: str = '/data/yuyangchen/data/MELD/train_sent_emo.csv',
+            audio_data_path: str = '/data/yuyangchen/data/MELD/train_A/train'
+    ):
+        """
+        Initialize the dataset.
+        
+        Args:
+            text_npz (str): Path to text features .npz file.
+            audio_npz (str): Path to audio features .npz file.
+            video_npz (str): Path to video features .npz file.
+            modalities (List[str]): List of modalities to include (e.g., ['T', 'A', 'V']).
+            split (str): Dataset split ('train' or 'test').
+            feature_type (str): Type of feature to load (e.g., 'pooled_features', 'sequence_features').
+        """
+        self.modalities = modalities
+        self.split = split
+        self.feature_type = feature_type
+        self.text_path = text_path
+        self.audio_csv_path = audio_csv_path
+        self.audio_data_path = audio_data_path
+
+        # Load features
+        self.text_data = self.load_text_features()
+        self.audio_data = self.load_audio_features()
+        self.video_data = self.load_features(video_npz, 'video') if 'V' in modalities else None
+
+        # Get common sample names (intersection across selected modalities)
+        sample_names_sets = []
+        if 'T' in modalities:
+            sample_names_sets.append(set(self.text_data['sample_names']))
+        if 'A' in modalities:
+            sample_names_sets.append(set(self.audio_data['sample_names']))
+        if 'V' in modalities:
+            sample_names_sets.append(set(self.video_data['sample_names']))
+
+        self.sample_names = sorted(list(set.intersection(*sample_names_sets)))
+        print(f"{split} split: {len(self.sample_names)} samples after alignment")
+
+        # 提取对齐后的特征
+        if 'T' in modalities:
+            indices = [self.text_data['sample_names'].index(name) for name in self.sample_names]
+            self.text_input_ids = self.text_data['input_ids'][indices]  # (num_samples, max_seq_length)
+            self.text_attention_mask = self.text_data['attention_mask'][indices]  # (num_samples, max_seq_length)
+            self.text_target_start_pos = self.text_data['target_start_pos'][indices]  # (num_samples,)
+            self.text_target_end_pos = self.text_data['target_end_pos'][indices]  # (num_samples,)
+            self.labels = self.text_data['labels'][indices]  # (num_samples,)
+            print(f"Aligned text input_ids shape: {self.text_input_ids.shape}")
+            print(f"Aligned text attention_mask shape: {self.text_attention_mask.shape}")
+
+        if 'A' in modalities:
+            indices = [self.audio_data['sample_names'].index(name) for name in self.sample_names]
+            self.audio_input_values = self.audio_data['input_values'][indices]  # (num_samples, max_seq_length)
+            self.audio_attention_mask = self.audio_data['attention_mask'][indices]  # (num_samples, max_seq_length)
+            print(f"Aligned audio input_values shape: {self.audio_input_values.shape}")
+            print(f"Aligned audio attention_mask shape: {self.audio_attention_mask.shape}")
+
+        if 'V' in modalities:
+            # 使用 np.where 查找索引
+            indices = [np.where(self.video_data['sample_names'] == name)[0][0] for name in self.sample_names]
+            self.video_features = self.video_data['sequence_features'][indices]
+            print(f"Aligned video shape: {self.video_features.shape}")
+
+        print(f"Aligned labels shape: {self.labels.shape}")
+
+    def load_features(self, npz_path: str, modality: str) -> Dict[str, Any]:
+        """
+        Load features from .npz file and validate.
+        
+        Args:
+            npz_path (str): Path to .npz file.
+            modality (str): Modality name for logging (e.g., 'text', 'audio', 'video').
+        
+        Returns:
+            Dict containing loaded features.
+        """
+        try:
+            data = np.load(npz_path, allow_pickle=True)
+            features = {key: data[key] for key in data}
+
+            # Validate feature_type
+            if self.feature_type not in features:
+                raise KeyError(
+                    f"Feature type '{self.feature_type}' not found in {npz_path}. Available keys: {list(features.keys())}")
+
+            # Validate sample_names and features
+            if 'sample_names' not in features:
+                raise KeyError(f"'sample_names' not found in {npz_path}")
+            print(f"Loaded {modality} features from {npz_path}: {len(features['sample_names'])} samples, "
+                  f"{self.feature_type} shape: {features[self.feature_type].shape}")
+
+            return features
+        except Exception as e:
+            print(f"Error loading {modality} features from {npz_path}: {e}")
+            raise
+
+    def load_text_features(self, context_len=6, max_seq_length=196, use_all_context=False, add_speaker=True):
+        """
+        加载原始文本数据，生成 RoBERTa 的输入特征。
+
+        参数：
+        - data_path (str): 数据文件路径（例如 meld_train_cleaned.csv）。
+        - tokenizer: RoBERTa 的 tokenizer（例如 RobertaTokenizer）。
+        - context_len (int): 上下文长度（默认 5）。
+        - max_seq_length (int): 最大序列长度（默认 512）。
+        - use_all_context (bool): 是否使用整个对话的所有上下文（默认 False）。
+        - add_speaker (bool): 是否将 speaker 添加到 utterance 中（默认 False）。
+
+        返回：
+        - dict: 包含以下键值对：
+            - sample_names: List[str]，样本名（例如，["dia0_utt0", "dia0_utt1", ...]）。
+            - input_ids: torch.Tensor，形状为 (num_samples, max_seq_length)。
+            - attention_mask: torch.Tensor，形状为 (num_samples, max_seq_length)。
+            - target_start_pos: torch.Tensor，形状为 (num_samples,)，目标话语的起始位置。
+            - target_end_pos: torch.Tensor，形状为 (num_samples,)，目标话语的结束位置。
+            - labels: torch.Tensor，形状为 (num_samples,)，情感标签。
+        """
+
+        tokenizer = RobertaTokenizer.from_pretrained("roberta-large")
+
+        # 初始化 wordMELDDataset
+        dataset = wordMELDDataset(
+            data_path=self.text_path,
+            tokenizer=tokenizer,
+            context_len=context_len,
+            max_seq_length=max_seq_length,
+            use_all_context=use_all_context,
+            add_speaker=add_speaker
+        )
+
+        # 收集数据
+        sample_names = []
+        input_ids_list = []
+        attention_mask_list = []
+        target_start_pos_list = []
+        target_end_pos_list = []
+        labels_list = []
+
+        for idx in range(len(dataset)):
+            sample = dataset[idx]
+            sample_names.append(sample["sample_name"])
+            input_ids_list.append(sample["input_ids"])
+            attention_mask_list.append(sample["attention_mask"])
+            target_start_pos_list.append(sample["target_start_pos"])
+            target_end_pos_list.append(sample["target_end_pos"])
+            labels_list.append(sample["label"])
+
+        # 转换为张量
+        return {
+            "sample_names": sample_names,
+            "input_ids": torch.stack(input_ids_list),  # (num_samples, max_seq_length)
+            "attention_mask": torch.stack(attention_mask_list),  # (num_samples, max_seq_length)
+            "target_start_pos": torch.tensor(target_start_pos_list, dtype=torch.long),  # (num_samples,)
+            "target_end_pos": torch.tensor(target_end_pos_list, dtype=torch.long),  # (num_samples,)
+            "labels": torch.stack(labels_list)  # (num_samples,)
+        }
+
+    def load_audio_features(self, max_seq_length=12 * 16000):
+
+        dataset = Dataset_meld_audio(
+            csv_path=self.audio_csv_path,
+            audio_directory=self.audio_data_path,
+            max_length=max_seq_length,
+            cache_dir="/data/yuyangchen/data/MELD/cache",
+            model_type="Whisper"
+        )
+
+        # 收集数据
+        sample_names = []
+        input_values_list = []
+        attention_mask_list = []
+        labels_list = []
+
+        for idx in range(len(dataset)):
+            sample = dataset[idx]
+            sample_names.append(sample["sample_name"])
+            input_values_list.append(sample["input_values"])
+            attention_mask_list.append(sample["attention_mask"])
+            labels_list.append(sample["targets"])
+
+        # 转换为张量
+        return {
+            "sample_names": sample_names,
+            "input_values": torch.stack(input_values_list),  # (num_samples, max_seq_length)
+            "attention_mask": torch.stack(attention_mask_list),  # (num_samples, max_seq_length)  # (num_samples,)
+            "labels": torch.stack(labels_list)  # (num_samples,)
+        }
+
+    def __len__(self) -> int:
+        """
+        Return the number of samples in the dataset.
+        """
+        return len(self.sample_names)
+
+    def __getitem__(self, idx):
+        sample = {}
+        if 'T' in self.modalities:
+            sample['text'] = {
+                'input_ids': self.text_input_ids[idx],  # (max_seq_length,)
+                'attention_mask': self.text_attention_mask[idx],  # (max_seq_length,)
+                'target_start_pos': self.text_target_start_pos[idx],  # scalar
+                'target_end_pos': self.text_target_end_pos[idx]  # scalar
+            }
+        if 'A' in self.modalities:
+            sample['audio'] = {
+                'input_values': self.audio_input_values[idx],  # (max_seq_length,)
+                'attention_mask': self.audio_attention_mask[idx]  # (max_seq_length,)
+            }
+        if 'V' in self.modalities:
+            sample['video'] = torch.tensor(self.video_features[idx], dtype=torch.float32)
+        sample['label'] = self.labels[idx]
+        return sample
