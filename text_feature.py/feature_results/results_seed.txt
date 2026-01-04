@@ -1,0 +1,11 @@
+=== Results Across Seeds ===
+Seed 41: Best Test Accuracy: 0.6866, Weighted-F1: 0.6734
+Seed 42: Best Test Accuracy: 0.6943, Weighted-F1: 0.6777
+Seed 43: Best Test Accuracy: 0.6912, Weighted-F1: 0.6800
+Seed 44: Best Test Accuracy: 0.6904, Weighted-F1: 0.6773
+Seed 45: Best Test Accuracy: 0.6866, Weighted-F1: 0.6736
+
+Best Test Accuracies: [0.6865900383141762, 0.6942528735632184, 0.6911877394636016, 0.6904214559386973, 0.6865900383141762]
+Mean Test Accuracy: 0.6898, Std Dev: 0.0029
+Corresponding Weighted-F1s: [0.6733656796172404, 0.6776662879038723, 0.6800418105781804, 0.6773115530410266, 0.6736486612472475]
+Mean Weighted-F1: 0.6764, Std Dev: 0.0025
